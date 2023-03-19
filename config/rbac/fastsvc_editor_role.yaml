@@ -1,0 +1,31 @@
+# permissions for end users to edit fastsvcs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: clusterrole
+    app.kubernetes.io/instance: fastsvc-editor-role
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/created-by: scheduler
+    app.kubernetes.io/part-of: scheduler
+    app.kubernetes.io/managed-by: kustomize
+  name: fastsvc-editor-role
+rules:
+- apiGroups:
+  - fastsvc.fastsvc.tum
+  resources:
+  - fastsvcs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - fastsvc.fastsvc.tum
+  resources:
+  - fastsvcs/status
+  verbs:
+  - get

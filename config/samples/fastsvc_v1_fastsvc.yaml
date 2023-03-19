@@ -1,0 +1,37 @@
+apiVersion: fastsvc.fastsvc.tum/v1
+kind: FaSTSvc
+metadata:
+  labels:
+    app.kubernetes.io/name: fastsvc
+    app.kubernetes.io/instance: fastsvc-sample
+    app.kubernetes.io/part-of: scheduler
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/created-by: scheduler
+  name: fastsvc-resnet
+  namespace: faas-share-fn
+spec:
+  selector:
+    matchLabels:
+      faas_function: fastsvc-resnet
+  podSpec:
+    containers:
+       - name: resnet
+         image: yukiozhu/mlperf-faas-resnet:pytorch #yukiozhu/resnet-flask:cuda11.3 #yukiozhu/mlperf-faas-resnet:pytorch
+         imagePullPolicy: Always #IfNotPresent
+         env:
+           - name: MODEL_NAME
+             value: "MLPerf-FaaS-ResNet"
+         ports:
+           - containerPort: 8080
+         readinessProbe:
+           tcpSocket:
+             port: 5000
+           initialDelaySeconds: 5
+           periodSeconds: 10
+         volumeMounts:
+           - name: "model-volume"
+             mountPath: "/models/"
+    volumes:
+       - name: "model-volume"
+         hostPath:
+           path: "/models/"
