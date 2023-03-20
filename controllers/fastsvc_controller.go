@@ -112,18 +112,20 @@ func (r *FaSTSvcReconciler) getDesiredCRDSpec(instance *fastsvcv1.FaSTSvc, nomin
 	extendedAnnotations := make(map[string]string)
 	extendedLabels := make(map[string]string)
 	// Prepare k8s CRD
+	quota := fmt.Sprintf("%0.2f", 0.1)
+	partition := strconv.Itoa(30)
 	extendedLabels["com.openfaas.scale.max"] = "1"
-	extendedAnnotations["kubeshare/gpu_request"] = "0.1"
+	extendedAnnotations["kubeshare/gpu_request"] = quota
 	extendedAnnotations["kubeshare/gpu_limit"] = "1.0"
 	extendedAnnotations["kubeshare/gpu_mem"] = "1073741824"
-	extendedAnnotations["kubeshare/gpu_partition"] = "30"
+	extendedAnnotations["kubeshare/gpu_partition"] = partition
 	extendedLabels["faas_function"] = instance.ObjectMeta.Name
 	var fixedReplica_int32 int32 = int32(1)
 
 	sharepod := &faasv1.SharePod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        instance.ObjectMeta.Name,
-			Namespace:   instance.GetNamespace(),
+			Name:        instance.ObjectMeta.Name + "-q" + quota + "-p" + partition,
+			Namespace:   "faas-share-fn",
 			Labels:      extendedLabels,
 			Annotations: extendedAnnotations,
 		},
