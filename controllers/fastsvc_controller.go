@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -39,6 +40,7 @@ import (
 	fastsvcv1 "github.com/YukioZzz/fastsvc/api/v1"
 	"github.com/prometheus/client_golang/api"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	faasv1 "github.com/Interstellarss/faas-share/pkg/apis/faasshare/v1"
 	clientset "github.com/Interstellarss/faas-share/pkg/client/clientset/versioned"
@@ -58,6 +60,7 @@ type FaSTSvcReconciler struct {
 func getRPS(funcname string, quota float64, partition int64) float64 {
 	return 30.0
 }
+
 func (c *FaSTSvcReconciler) getNominalRPS() map[string]float64 {
 	targetTotalRPS := make(map[string]float64)
 	klog.Info("sharepodlist trying to list now!")
@@ -80,73 +83,167 @@ func (c *FaSTSvcReconciler) getNominalRPS() map[string]float64 {
 }
 
 // reconcileServiceCRD reconciles the ML CRD containing the ML service under test
-func (r *FaSTSvcReconciler) reconcileServiceCRD(instance *fastsvcv1.FaSTSvc, sharepod *faasv1.SharePod) (*faasv1.SharePod, error) {
+func (r *FaSTSvcReconciler) reconcileServiceCRD(instance *fastsvcv1.FaSTSvc, sharepods []*faasv1.SharePod) error {
 	logger := log.FromContext(context.TODO())
 
-	err := r.Get(context.TODO(), types.NamespacedName{Name: sharepod.GetName(), Namespace: sharepod.GetNamespace()}, sharepod)
-	if err != nil {
-		// If not created, create the service CRD
-		if errors.IsNotFound(err) {
-			klog.Info("Creating sharepod crd", "name", sharepod.GetName())
-			err = r.Create(context.TODO(), sharepod)
-			if err != nil {
-				logger.Error(err, "Create service CRD error", "name", sharepod.GetName())
-				return nil, err
+	for _, sharepod := range sharepods {
+		existed := &faasv1.SharePod{}
+		err := r.Get(context.TODO(), types.NamespacedName{Name: sharepod.GetName(), Namespace: sharepod.GetNamespace()}, existed)
+		if err != nil {
+			// If not created, create the service CRD
+			if errors.IsNotFound(err) {
+				klog.Info("Creating sharepod crd ", sharepod.GetName())
+				err = r.Create(context.TODO(), sharepod)
+				if err != nil {
+					logger.Error(err, "Create service CRD error", "name", sharepod.GetName())
+					return err
+				}
+			} else {
+				logger.Error(err, "Get sharepod CRD error", "name", sharepod.GetName())
+				return err
 			}
-		} else {
-			logger.Error(err, "Get sharepod CRD error", "name", sharepod.GetName())
-			return nil, err
+		}
+		replica := int32(*sharepod.Spec.Replicas)
+		klog.Info("Updating sharepod crd ", sharepod.GetName(), " with Replica ", replica)
+		existed.Spec.Replicas = &replica
+		err = r.Update(context.TODO(), existed)
+		if err != nil {
+			logger.Error(err, "failed to update CRD")
+			return err
 		}
 	}
-	return sharepod, nil
+	return nil
 }
 
-func (r *FaSTSvcReconciler) getDesiredCRDSpec(instance *fastsvcv1.FaSTSvc, nominalRPS float64, currentRPS float64) (*faasv1.SharePod, error) {
-	// Prepare podTemplate and embed tunable parameters
-	podSpec := corev1.PodSpec{}
-	selector := metav1.LabelSelector{}
-	if &instance.Spec != nil {
-		instance.Spec.PodSpec.DeepCopyInto(&podSpec)
-		instance.Spec.Selector.DeepCopyInto(&selector)
-	}
-	extendedAnnotations := make(map[string]string)
-	extendedLabels := make(map[string]string)
-	// Prepare k8s CRD
-	quota := fmt.Sprintf("%0.2f", 0.1)
-	partition := strconv.Itoa(30)
-	extendedLabels["com.openfaas.scale.max"] = "1"
-	extendedAnnotations["kubeshare/gpu_request"] = quota
-	extendedAnnotations["kubeshare/gpu_limit"] = "1.0"
-	extendedAnnotations["kubeshare/gpu_mem"] = "1073741824"
-	extendedAnnotations["kubeshare/gpu_partition"] = partition
-	extendedLabels["faas_function"] = instance.ObjectMeta.Name
-	var fixedReplica_int32 int32 = int32(1)
+func (r *FaSTSvcReconciler) configs2sharepods(instance *fastsvcv1.FaSTSvc, configs []*SharePodConfig) ([]*faasv1.SharePod, error) {
+	sharepodList := make([]*faasv1.SharePod, 0)
+	for _, config := range configs {
+		klog.Info("Creating New sharepods with config ", getKeyName(config.Quota, config.Partition), " and Replica: ", config.Replica)
+		// Prepare podTemplate and embed tunable parameters
+		podSpec := corev1.PodSpec{}
+		selector := metav1.LabelSelector{}
+		if &instance.Spec != nil {
+			instance.Spec.PodSpec.DeepCopyInto(&podSpec)
+			instance.Spec.Selector.DeepCopyInto(&selector)
+		}
+		extendedAnnotations := make(map[string]string)
+		extendedLabels := make(map[string]string)
+		// Prepare k8s CRD
+		quota := fmt.Sprintf("%0.2f", float64(config.Quota)/100.0)
+		partition := strconv.Itoa(int(config.Partition))
+		extendedLabels["com.openfaas.scale.min"] = strconv.Itoa(int(config.Replica))
+		extendedLabels["com.openfaas.scale.max"] = strconv.Itoa(int(config.Replica))
+		extendedAnnotations["kubeshare/gpu_request"] = quota
+		extendedAnnotations["kubeshare/gpu_limit"] = "1.0"
+		extendedAnnotations["kubeshare/gpu_mem"] = "1073741824"
+		extendedAnnotations["kubeshare/gpu_partition"] = partition
+		extendedLabels["faas_function"] = instance.ObjectMeta.Name
+		fixedReplica_int32 := int32(config.Replica)
 
-	sharepod := &faasv1.SharePod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        instance.ObjectMeta.Name + "-q" + quota + "-p" + partition,
-			Namespace:   "faas-share-fn",
-			Labels:      extendedLabels,
-			Annotations: extendedAnnotations,
-		},
-		Spec: faasv1.SharePodSpec{
-			Selector: &selector,
-			PodSpec:  podSpec,
-			Replicas: &fixedReplica_int32,
-		},
+		sharepod := &faasv1.SharePod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        instance.ObjectMeta.Name + getKeyName(config.Quota, config.Partition),
+				Namespace:   "faas-share-fn",
+				Labels:      extendedLabels,
+				Annotations: extendedAnnotations,
+			},
+			Spec: faasv1.SharePodSpec{
+				Selector: &selector,
+				PodSpec:  podSpec,
+				Replicas: &fixedReplica_int32,
+			},
+		}
+		// ToDo: SetControllerReference here is useless, as the controller delete svc upon trial completion
+		// Add owner reference to the service so that it could be GC
+		if err := controllerutil.SetControllerReference(instance, sharepod, r.Scheme); err != nil {
+			klog.Info("Error setting ownerref")
+			return nil, err
+		}
+		sharepodList = append(sharepodList, sharepod)
 	}
-	// ToDo: SetControllerReference here is useless, as the controller delete svc upon trial completion
-	// Add owner reference to the service so that it could be GC
-	//if err := controllerutil.SetControllerReference(instance, sharepod, r.Scheme); err != nil {
-	//	return nil, err
+	return sharepodList, nil
+}
+
+func getKeyName(quota int64, partition int64) string {
+	return "-q" + strconv.Itoa(int(quota)) + "-p" + strconv.Itoa(int(partition))
+}
+func (c *FaSTSvcReconciler) getNominalRPSList(funcname string) (map[string]int64, float64) {
+	klog.Info("sharepodLister trying to list now!")
+	selector := labels.SelectorFromSet(labels.Set{"faas_function": funcname})
+	sharePodList, _ := c.sharepodLister.List(selector)
+	quota := 0.0
+	targetTotalRPS := 0.0
+	partition := int64(100)
+	klog.Info("Number of sharepod:", len(sharePodList))
+	nominalRPSList := make(map[string]int64)
+	for _, sharepod := range sharePodList {
+		quota, _ = strconv.ParseFloat(sharepod.ObjectMeta.Annotations[faasv1.KubeShareResourceGPURequest], 64)
+		partition, _ = strconv.ParseInt(sharepod.ObjectMeta.Annotations[faasv1.KubeShareResourceGPUPartition], 10, 64)
+		replicas := int64(*sharepod.Spec.Replicas)
+		klog.Info("Funcname:", funcname, " Quota:", quota, " Partition:", partition, " detected")
+		nominalRPSList[getKeyName(int64(quota*100), partition)] = replicas
+		targetTotalRPS += getRPS(funcname, quota, partition) * float64(replicas)
+	}
+	klog.Info("totalRPS of ", funcname, ":", targetTotalRPS)
+	return nominalRPSList, targetTotalRPS
+}
+
+type SharePodConfig struct {
+	Quota     int64 //percentage
+	Partition int64 //percentage
+	Replica   int64
+}
+
+func getEfficientConfig() (SharePodConfig, float64) {
+	return SharePodConfig{30, 12, 1}, 50.0
+}
+func (r *FaSTSvcReconciler) schedule(request float64) []*SharePodConfig {
+	var configs []*SharePodConfig
+	// scheduleSaturate
+	configs_eff, rps_eff := getEfficientConfig()
+	configs_eff.Replica = int64(request / rps_eff)
+	residue_loads := math.Mod(request, rps_eff)
+
+	// scheduleResidule
+	if residue_loads > 0.0 {
+		configs_ideal, _ := getEfficientConfig() //argminp(ProcessRatei[p] − ri) where ProcessRatei[p] > ri
+		if configs_eff.Quota == configs_ideal.Quota && configs_eff.Partition == configs_ideal.Partition {
+			configs_eff.Replica += 1
+		} else {
+			configs = append(configs, &configs_ideal)
+		}
+	}
+
+	configs = append(configs, &configs_eff)
+	return configs
+}
+
+func (r *FaSTSvcReconciler) getDesiredCRDSpec(instance *fastsvcv1.FaSTSvc, currentRPS float64) []*faasv1.SharePod {
+	// compare nominal and current real rps
+	// if too much, then scale down
+	nominalRPSList, totalRPS := r.getNominalRPSList(instance.ObjectMeta.Name)
+	// scale up first
+	newRequests := currentRPS + 1.0 - totalRPS
+	if newRequests > 0 {
+		klog.Info("scaling up now")
+		configsList := r.schedule(newRequests)
+		for _, config := range configsList {
+			config.Replica += nominalRPSList[getKeyName(config.Quota, config.Partition)]
+		}
+		sharepods, _ := r.configs2sharepods(instance, configsList)
+		return sharepods
+	}
+	// else, scale down. Traverse from small to big and pop out smallest
+	//for i, val := range nominalRPSList {
+	//	if totalRPS - val > currentRPS{
+	//                totalRPS -= val
+	//	} else {
+	//                break
+	//	}
 	//}
-	return sharepod, nil
-}
 
-//func (r *FaSTSvcReconciler) updateSharepodsConfig(instance *fastsvcv1.FaSTSvc, nominalRPS float64) ([]*faasv1.SharePod, error) {
-//
-//
-//}
+	return nil
+}
 
 func (r *FaSTSvcReconciler) bypassReconcile() {
 	// Get real RPS
@@ -163,7 +260,6 @@ func (r *FaSTSvcReconciler) bypassReconcile() {
 		if err := r.List(ctx, &allFaSTSvcs); err != nil {
 			return
 		}
-		nominalRPSMAP := r.getNominalRPS()
 
 		// loop through each FaSTSvc resource
 		for _, svc := range allFaSTSvcs.Items {
@@ -174,7 +270,6 @@ func (r *FaSTSvcReconciler) bypassReconcile() {
 			klog.Info("Query:", query)
 			currentRPSvec, _, err := r.promv1api.Query(ctx, query, time.Now())
 			currentRPS := float64(0.0)
-			nominalRPS := float64(0.0)
 			if err != nil {
 				continue
 			} else {
@@ -185,20 +280,8 @@ func (r *FaSTSvcReconciler) bypassReconcile() {
 			}
 			// process the Prometheus query result to get the RPS value
 			klog.Info("current rps: ", currentRPS)
-			//newSharePods := updateSharepodsConfig(&svc, currentRPS)
-			if nmnRPS, ok := nominalRPSMAP[funcName]; !ok {
-				klog.Info("Does not have nominal rps for ", funcName, ", set as zero")
-			} else {
-				nominalRPS = nmnRPS
-			}
-			// do something with the RPS value
-			klog.Info("Nominal rps", nominalRPS)
-			desiredCRD, err := r.getDesiredCRDSpec(&svc, nominalRPS, currentRPS)
-			if err != nil {
-				logger.Error(err, "Target CRD construction error")
-				continue
-			}
-			_, err = r.reconcileServiceCRD(&svc, desiredCRD)
+			desiredCRDs := r.getDesiredCRDSpec(&svc, currentRPS)
+			err = r.reconcileServiceCRD(&svc, desiredCRDs)
 			if err != nil {
 				logger.Error(err, "Reconcile CRD error")
 				continue
