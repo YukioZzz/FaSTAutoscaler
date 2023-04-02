@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
+	"regexp"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -167,6 +168,22 @@ func (r *FaSTSvcReconciler) configs2sharepods(instance *fastsvcv1.FaSTSvc, confi
 func getKeyName(quota int64, partition int64) string {
 	return "-q" + strconv.Itoa(int(quota)) + "-p" + strconv.Itoa(int(partition))
 }
+func parseFromKeyName(key string) (int, int) {
+	r := regexp.MustCompile(`-q(\d+)-p(\d+)`)
+	match := r.FindStringSubmatch(key)
+	if match == nil {
+		return 0, 0
+	}
+	quota, err := strconv.Atoi(match[1])
+	if err != nil {
+		return 0, 0
+	}
+	partition, err := strconv.Atoi(match[2])
+	if err != nil {
+		return 0, 0
+	}
+	return quota, partition
+}
 func (c *FaSTSvcReconciler) getNominalRPSList(funcname string) (map[string]int64, float64) {
 	klog.Info("sharepodLister trying to list now!")
 	selector := labels.SelectorFromSet(labels.Set{"faas_function": funcname})
@@ -218,6 +235,27 @@ func (r *FaSTSvcReconciler) schedule(request float64) []*SharePodConfig {
 	return configs
 }
 
+func (r *FaSTSvcReconciler) scaleDownSharepod(funcname string, replica int64) {
+	existed := &faasv1.SharePod{}
+	err := r.Get(context.TODO(), types.NamespacedName{Name: funcname, Namespace: "faas-share-fn"}, existed)
+	if err != nil {
+		// If not created, report error
+		klog.Error("scale down error with getter fail")
+		return
+	}
+	replicas := int32(replica)
+	klog.Info("Updating sharepod crd ", funcname, " with Replica ", replicas)
+	existed.Spec.Replicas = &replicas
+	existed.ObjectMeta.Labels["com.openfaas.scale.max"] = strconv.Itoa(int(replicas))
+	existed.ObjectMeta.Labels["com.openfaas.scale.min"] = strconv.Itoa(int(replicas))
+	err = r.Update(context.TODO(), existed)
+	if err != nil {
+		klog.Error("failed to update CRD when scaling down")
+		return
+	}
+
+}
+
 func (r *FaSTSvcReconciler) getDesiredCRDSpec(instance *fastsvcv1.FaSTSvc, currentRPS float64) []*faasv1.SharePod {
 	// compare nominal and current real rps
 	// if too much, then scale down
@@ -232,15 +270,23 @@ func (r *FaSTSvcReconciler) getDesiredCRDSpec(instance *fastsvcv1.FaSTSvc, curre
 		}
 		sharepods, _ := r.configs2sharepods(instance, configsList)
 		return sharepods
+	} else if newRequests < 0 {
+		// else, scale down. Traverse from small to big and pop out smallest
+		newRequests = newRequests * -1
+		for key, replica := range nominalRPSList {
+			quota, partition := parseFromKeyName(key)
+			rpsUnit := getRPS(instance.ObjectMeta.Name, float64(quota)/100.0, int64(partition))
+			n := int64(newRequests / rpsUnit)
+			if replica > n {
+				replica = replica - n
+				newRequests = newRequests - float64(n)*rpsUnit
+			} else {
+				replica = 0
+				newRequests = newRequests - float64(replica)*rpsUnit
+			}
+			r.scaleDownSharepod(instance.ObjectMeta.Name+key, replica)
+		}
 	}
-	// else, scale down. Traverse from small to big and pop out smallest
-	//for i, val := range nominalRPSList {
-	//	if totalRPS - val > currentRPS{
-	//                totalRPS -= val
-	//	} else {
-	//                break
-	//	}
-	//}
 
 	return nil
 }
