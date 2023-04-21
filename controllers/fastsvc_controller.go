@@ -265,6 +265,8 @@ func (r *FaSTSvcReconciler) getDesiredCRDSpec(instance *fastsvcv1.FaSTSvc, curre
 
 	scaling := (pastRPS - oldRPS) > 0
 
+	klog.Infof("avg rate of past 30: %.2f, ave rate of past 60: %.2f")
+
 	if newRequests > 0 || !scaling {
 		klog.Info("scaling up now")
 		configsList := r.schedule(newRequests)
@@ -273,12 +275,14 @@ func (r *FaSTSvcReconciler) getDesiredCRDSpec(instance *fastsvcv1.FaSTSvc, curre
 		}
 		sharepods, _ := r.configs2sharepods(instance, configsList)
 		return sharepods
-	} else if scaling {
+	} else if scaling && oldRPS > 0 {
 		//new scale up logic
 		klog.Info("new scaling up now")
 		configsList := r.schedule(newRequests)
 		for _, config := range configsList {
+			klog.Infof("old replica: %d", config.Replica)
 			config.Replica = int64(math.Ceil(float64(config.Replica) * pastRPS * pastRPS / oldRPS))
+			klog.Infof("new replica: %d", config.Replica)
 		}
 		sharepods, _ := r.configs2sharepods(instance, configsList)
 		return sharepods
