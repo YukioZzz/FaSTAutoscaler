@@ -347,15 +347,19 @@ func (r *FaSTSvcReconciler) bypassReconcile() {
 			}
 
 			pastquery := fmt.Sprintf("avg(rate(gateway_function_invocation_total{function_name='%s.%s'}[30s]))", funcName, svc.ObjectMeta.Namespace)
+
 			pastRPSvec, _, err := r.promv1api.Query(ctx, pastquery, time.Now())
+
 			pastRPS := float64(0.0)
+			//print(pastRPSvec)
 
 			if err != nil {
 				continue
 			} else {
 				if pastRPSvec.(model.Vector).Len() != 0 {
-					klog.Info("avg past 30s rps vec:", pastRPS)
+					klog.Info("avg past 30s rps vec:", pastRPSvec)
 					pastRPS = float64(pastRPSvec.(model.Vector)[0].Value)
+
 				}
 			}
 
@@ -368,7 +372,7 @@ func (r *FaSTSvcReconciler) bypassReconcile() {
 				continue
 			} else {
 				if pastRPSvec.(model.Vector).Len() != 0 {
-					klog.Info("avg old 30s rps vec:", oldRPS)
+					klog.Info("avg old 30s rps vec:", oldRPSvec)
 					oldRPS = float64(oldRPSvec.(model.Vector)[0].Value)
 				}
 			}
