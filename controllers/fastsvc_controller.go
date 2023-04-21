@@ -281,7 +281,10 @@ func (r *FaSTSvcReconciler) getDesiredCRDSpec(instance *fastsvcv1.FaSTSvc, curre
 		configsList := r.schedule(newRequests)
 		for _, config := range configsList {
 			klog.Infof("old replica: %d", config.Replica)
-			config.Replica = int64(math.Ceil(float64(config.Replica) * pastRPS * pastRPS / oldRPS))
+			factor := pastRPS * pastRPS / oldRPS
+			var tmp float64
+			tmp = float64(config.Replica) * factor
+			config.Replica = int64(math.Ceil(tmp))
 			klog.Infof("new replica: %d", config.Replica)
 		}
 		sharepods, _ := r.configs2sharepods(instance, configsList)
@@ -365,8 +368,8 @@ func (r *FaSTSvcReconciler) bypassReconcile() {
 				continue
 			} else {
 				if pastRPSvec.(model.Vector).Len() != 0 {
-					klog.Info("avg past 30s rps vec:", oldRPS)
-					pastRPS = float64(oldRPSvec.(model.Vector)[0].Value)
+					klog.Info("avg old 30s rps vec:", oldRPS)
+					oldRPS = float64(oldRPSvec.(model.Vector)[0].Value)
 				}
 			}
 
