@@ -256,16 +256,16 @@ func (r *FaSTSvcReconciler) scaleDownSharepod(funcname string, replica int64) {
 
 }
 
-func (r *FaSTSvcReconciler) getDesiredCRDSpec(instance *fastsvcv1.FaSTSvc, currentRPS float64, pastRPS float64) []*faasv1.SharePod {
+func (r *FaSTSvcReconciler) getDesiredCRDSpec(instance *fastsvcv1.FaSTSvc, currentRPS, pastRPS, oldRPS float64) []*faasv1.SharePod {
 	// compare nominal and current real rps
 	// if too much, then scale down
 	nominalRPSList, totalRPS := r.getNominalRPSList(instance.ObjectMeta.Name)
 	// scale up first
 	newRequests := currentRPS + 1.0 - totalRPS
 
-	preidct := currentRPS - pastRPS
+	scaling := (pastRPS - oldRPS) > 0
 
-	if newRequests > 0 || preidct >= 30 {
+	if newRequests > 0 || !scaling {
 		klog.Info("scaling up now")
 		configsList := r.schedule(newRequests)
 		for _, config := range configsList {
@@ -273,6 +273,16 @@ func (r *FaSTSvcReconciler) getDesiredCRDSpec(instance *fastsvcv1.FaSTSvc, curre
 		}
 		sharepods, _ := r.configs2sharepods(instance, configsList)
 		return sharepods
+	} else if scaling {
+		//new scale up logic
+		klog.Info("new scaling up now")
+		configsList := r.schedule(newRequests)
+		for _, config := range configsList {
+			config.Replica = int64(math.Ceil(float64(config.Replica) * pastRPS * pastRPS / oldRPS))
+		}
+		sharepods, _ := r.configs2sharepods(instance, configsList)
+		return sharepods
+
 	} else if newRequests < 0 {
 		// else, scale down. Traverse from small to big and pop out smallest
 		newRequests = newRequests * -1
@@ -329,21 +339,36 @@ func (r *FaSTSvcReconciler) bypassReconcile() {
 				}
 			}
 
-			pastRPSvec, _, err := r.promv1api.Query(ctx, query, time.Now().Add(-30*time.Second))
+			pastquery := fmt.Sprintf("avg(rate(gateway_function_invocation_total{function_name='%s.%s'}[30s]))", funcName, svc.ObjectMeta.Namespace)
+			pastRPSvec, _, err := r.promv1api.Query(ctx, pastquery, time.Now())
 			pastRPS := float64(0.0)
 
 			if err != nil {
 				continue
 			} else {
 				if pastRPSvec.(model.Vector).Len() != 0 {
-					klog.Info("past 30s rps vec:", pastRPS)
+					klog.Info("avg past 30s rps vec:", pastRPS)
 					pastRPS = float64(pastRPSvec.(model.Vector)[0].Value)
+				}
+			}
+
+			old := time.Now().Add(-30 * time.Second)
+			//oldquery := fmt.Sprintf("avg(rate(gateway_function_invocation_total{function_name='%s.%s'}[30s]))", funcName, svc.ObjectMeta.Namespace)
+			oldRPSvec, _, err := r.promv1api.Query(ctx, pastquery, old)
+			oldRPS := float64(0.0)
+
+			if err != nil {
+				continue
+			} else {
+				if pastRPSvec.(model.Vector).Len() != 0 {
+					klog.Info("avg past 30s rps vec:", oldRPS)
+					pastRPS = float64(oldRPSvec.(model.Vector)[0].Value)
 				}
 			}
 
 			// process the Prometheus query result to get the RPS value
 			klog.Info("current rps: ", currentRPS)
-			desiredCRDs := r.getDesiredCRDSpec(&svc, currentRPS, pastRPS)
+			desiredCRDs := r.getDesiredCRDSpec(&svc, currentRPS, pastRPS, oldRPS)
 			err = r.reconcileServiceCRD(&svc, desiredCRDs)
 			if err != nil {
 				logger.Error(err, "Reconcile CRD error")
